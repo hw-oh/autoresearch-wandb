@@ -10,12 +10,29 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 import gc
 import math
+import subprocess
 import time
 from dataclasses import dataclass, asdict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# wandb integration (best-effort, never blocks training)
+try:
+    import wandb
+    _WANDB_AVAILABLE = True
+except ImportError:
+    _WANDB_AVAILABLE = False
+
+def wandb_safe(fn):
+    """Call fn() but swallow any wandb errors."""
+    if not _WANDB_AVAILABLE:
+        return
+    try:
+        fn()
+    except Exception:
+        pass
 
 from kernels import get_kernel
 cap = torch.cuda.get_device_capability()
@@ -450,6 +467,14 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 DEPTH = 8               # number of transformer layers
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
+# Git commit hash for experiment tracking
+try:
+    _GIT_HASH = subprocess.check_output(
+        ["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL
+    ).decode().strip()
+except Exception:
+    _GIT_HASH = "unknown"
+
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
 # ---------------------------------------------------------------------------
@@ -513,6 +538,33 @@ x, y, epoch = next(train_loader)  # prefetch first batch
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
 
+# Initialize wandb
+wandb_safe(lambda: wandb.init(
+    project="autoresearch",
+    config={
+        "ASPECT_RATIO": ASPECT_RATIO,
+        "HEAD_DIM": HEAD_DIM,
+        "WINDOW_PATTERN": WINDOW_PATTERN,
+        "TOTAL_BATCH_SIZE": TOTAL_BATCH_SIZE,
+        "EMBEDDING_LR": EMBEDDING_LR,
+        "UNEMBEDDING_LR": UNEMBEDDING_LR,
+        "MATRIX_LR": MATRIX_LR,
+        "SCALAR_LR": SCALAR_LR,
+        "WEIGHT_DECAY": WEIGHT_DECAY,
+        "ADAM_BETAS": ADAM_BETAS,
+        "WARMUP_RATIO": WARMUP_RATIO,
+        "WARMDOWN_RATIO": WARMDOWN_RATIO,
+        "FINAL_LR_FRAC": FINAL_LR_FRAC,
+        "DEPTH": DEPTH,
+        "DEVICE_BATCH_SIZE": DEVICE_BATCH_SIZE,
+        **asdict(config),
+        "num_params": num_params,
+        "git_commit": _GIT_HASH,
+    },
+    tags=[_GIT_HASH],
+    save_code=False,
+))
+
 # Schedules (all based on progress = training_time / TIME_BUDGET)
 
 def get_lr_multiplier(progress):
@@ -569,6 +621,7 @@ while True:
     # Fast fail: abort if loss is exploding or NaN
     if math.isnan(train_loss_f) or train_loss_f > 100:
         print("FAIL")
+        wandb_safe(lambda: wandb.finish(exit_code=1))
         exit(1)
 
     torch.cuda.synchronize()
@@ -588,6 +641,18 @@ while True:
     remaining = max(0, TIME_BUDGET - total_training_time)
 
     print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+
+    if step % 10 == 0:
+        wandb_safe(lambda: wandb.log({
+            "loss": debiased_smooth_loss,
+            "raw_train_loss": train_loss_f,
+            "lr_multiplier": lrm,
+            "step_time_ms": dt * 1000,
+            "tokens_per_sec": tok_per_sec,
+            "mfu_percent": mfu,
+            "epoch": epoch,
+            "progress_pct": pct_done,
+        }, step=step))
 
     # GC management (Python's GC causes ~500ms stalls)
     if step == 0:
@@ -628,3 +693,16 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+
+wandb_safe(lambda: wandb.summary.update({
+    "val_bpb": val_bpb,
+    "training_seconds": total_training_time,
+    "total_seconds": t_end - t_start,
+    "peak_vram_mb": peak_vram_mb,
+    "mfu_percent": steady_state_mfu,
+    "total_tokens_M": total_tokens / 1e6,
+    "num_steps": step,
+    "num_params_M": num_params / 1e6,
+    "depth": DEPTH,
+}))
+wandb_safe(lambda: wandb.finish())

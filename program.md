@@ -13,8 +13,9 @@ To set up a new experiment, work with the user to:
    - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
    - `train.py` — the file you modify. Model architecture, optimizer, training loop.
 4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
-5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
-6. **Confirm and go**: Confirm setup looks good.
+5. **Verify wandb**: Ensure `WANDB_API_KEY` is set in the environment, or run `wandb login`. If wandb is not configured, training will still work normally without logging.
+6. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
+7. **Confirm and go**: Confirm setup looks good.
 
 Once you get confirmation, kick off the experimentation.
 
@@ -27,7 +28,7 @@ Each experiment runs on a single GPU. The training script runs for a **fixed tim
 
 **What you CANNOT do:**
 - Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, tokenizer, and training constants (time budget, sequence length, etc).
-- Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
+- Install new packages or add dependencies beyond what's in `pyproject.toml`. (`wandb` is already included.)
 - Modify the evaluation harness. The `evaluate_bpb` function in `prepare.py` is the ground truth metric.
 
 **The goal is simple: get the lowest val_bpb.** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
@@ -87,6 +88,38 @@ c3d4e5f	1.005000	44.0	discard	switch to GeLU activation
 d4e5f6g	0.000000	0.0	crash	double model width (OOM)
 ```
 
+## Querying Past Experiments (wandb)
+
+All experiments are automatically logged to wandb (project: `autoresearch`). Before deciding what to try next, query wandb for insights. Run this Python snippet:
+
+```python
+import wandb
+api = wandb.Api()
+runs = api.runs("autoresearch", order="-summary_metrics.val_bpb")
+print(f"{'val_bpb':>10} {'DEPTH':>5} {'MATRIX_LR':>10} {'commit':>8}  name")
+for run in runs:
+    s = run.summary
+    c = run.config
+    val = s.get("val_bpb", "N/A")
+    depth = c.get("DEPTH", "?")
+    mlr = c.get("MATRIX_LR", "?")
+    commit = c.get("git_commit", "?")
+    print(f"{val:>10} {depth:>5} {mlr:>10} {commit:>8}  {run.name}")
+```
+
+Use this to:
+- See which hyperparameter ranges have been tried
+- Identify which changes improved val_bpb
+- Avoid re-running experiments that already failed
+- Spot trends (e.g., "higher MATRIX_LR helps", "DEPTH > 10 hurts at this budget")
+
+You can also inspect individual runs:
+```python
+for run in runs:
+    print(run.config)  # all hyperparameters
+    print(run.summary) # all final metrics
+```
+
 ## The experiment loop
 
 The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).
@@ -94,14 +127,15 @@ The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autorese
 LOOP FOREVER:
 
 1. Look at the git state: the current branch/commit we're on
-2. Tune `train.py` with an experimental idea by directly hacking the code.
-3. git commit
-4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
-6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
-9. If val_bpb is equal or worse, you git reset back to where you started
+2. Query wandb for past experiment insights (every few iterations, not necessarily every single one) to inform your next hypothesis
+3. Tune `train.py` with an experimental idea by directly hacking the code.
+4. git commit
+5. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
+6. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
+7. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
+8. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
+9. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
+10. If val_bpb is equal or worse, you git reset back to where you started
 
 The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
 
