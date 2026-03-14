@@ -642,6 +642,10 @@ while True:
 
     print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
 
+    # Machine-readable checkpoint (newline-based, easy to grep from run.log)
+    if step > 0 and step % 50 == 0:
+        print(f"\nCHECKPOINT step={step} loss={debiased_smooth_loss:.6f} progress={pct_done:.1f} mfu={mfu:.1f}", flush=True)
+
     if step % 10 == 0:
         wandb_safe(lambda: wandb.log({
             "loss": debiased_smooth_loss,
